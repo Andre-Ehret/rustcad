@@ -1,0 +1,20 @@
+[package]
+name = "rustcad-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rustcad-core.workspace = true
+rustcad-geom.workspace = true
+rustcad-sketch.workspace = true
+
+eframe.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+anyhow.workspace = true
+env_logger.workspace = true
+rfd.workspace = true

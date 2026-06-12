@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rustcad-core",
+    "crates/rustcad-sketch",
+    "crates/rustcad-geom",
+    "crates/rustcad-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Geometrie-Kernel — Versionen gepinnt (API noch in Bewegung, siehe TECH_SPEC §3)
+truck-modeling = "=0.6.0"
+truck-meshalgo = "=0.4.0"
+truck-polymesh = "=0.6.0"
+
+# GUI / Rendering
+eframe = "0.34.3"
+egui = "0.34.3"
+egui-wgpu = "0.34.3"
+glam = "0.33"
+bytemuck = { version = "1", features = ["derive"] }
+
+# Sonstiges
+slotmap = { version = "1.1", features = ["serde"] }
+nalgebra = "0.35"
+serde = { version = "1", features = ["derive"] }
+ron = "0.10"
+rfd = "0.17"
+thiserror = "2"
+anyhow = "1"
+env_logger = "0.11"
+proptest = "1"
+
+# interne Crates
+rustcad-core = { path = "crates/rustcad-core" }
+rustcad-sketch = { path = "crates/rustcad-sketch" }
+rustcad-geom = { path = "crates/rustcad-geom" }
+
+# Abhängigkeiten optimiert bauen, sonst ist die Tessellierung im Dev-Build zäh
+[profile.dev.package."*"]
+opt-level = 2
