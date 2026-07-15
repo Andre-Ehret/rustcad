@@ -1,9 +1,12 @@
+use std::collections::HashMap;
+
 use egui::{Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use glam::{Mat4, Vec3};
 use rustcad_core::{FeatureId, SketchPlane};
 use rustcad_sketch::{
-    Constraint, Dimension, DimensionError, DimensionId, DimensionKind, DimensionTarget, EntityId,
-    PointId, Sketch, SketchEntity, SolveResult,
+    Constraint, ConstraintId, ConstraintKind, ConstraintRef, Dimension, DimensionError,
+    DimensionId, DimensionKind, DimensionTarget, EntityId, PointId, Sketch, SketchEntity,
+    SolveResult,
 };
 
 use crate::camera::OrbitCamera;
@@ -11,6 +14,13 @@ use crate::camera::OrbitCamera;
 const SNAP_RADIUS_PX: f32 = 10.0;
 const SELECT_TOL_PX: f32 = 6.0;
 const CIRCLE_SEGMENTS: usize = 48;
+
+/// Kantenlänge eines Constraint-Glyphs im Screen-Space (zoom-unabhängig).
+const GLYPH_SIZE_PX: f32 = 15.0;
+/// Abstand gestapelter Glyphen desselben Ankers.
+const GLYPH_GAP_PX: f32 = 2.0;
+/// Versatz des Glyph-Stapels vom Ankerpunkt (rechts oberhalb der Geometrie).
+const GLYPH_OFFSET_PX: Vec2 = Vec2::new(11.0, -11.0);
 
 /// Nachkommastellen der Bemaßungsanzeige. Zentral gehalten und für
 /// spätere Einheiten (mm/inch) vorbereitet — siehe [`format_dimension`].
@@ -29,6 +39,10 @@ const COLOR_COMPLETED: Color32 = Color32::from_rgb(95, 115, 150);
 const COLOR_DIM: Color32 = Color32::from_rgb(210, 170, 120);
 const COLOR_DIM_HOVER: Color32 = Color32::from_rgb(245, 205, 140);
 const COLOR_DIM_LABEL_BG: Color32 = Color32::from_rgba_premultiplied(20, 22, 28, 200);
+const COLOR_GLYPH: Color32 = Color32::from_rgb(150, 205, 150);
+const COLOR_GLYPH_HOVER: Color32 = Color32::from_rgb(130, 235, 200);
+/// Highlight für die Geometrie, die ein gehoverter Glyph referenziert.
+const COLOR_HIGHLIGHT: Color32 = Color32::from_rgb(130, 235, 200);
 
 /// Zentrale Zahlenformatierung für Bemaßungen (feste Nachkommastellen).
 /// Einheiten folgen später — deshalb hier gebündelt.
@@ -134,12 +148,13 @@ pub struct PendingPoint {
     existing: Option<PointId>,
 }
 
-/// Ein selektierbares Element: Punkt, Entity oder Bemaßung.
+/// Ein selektierbares Element: Punkt, Entity, Bemaßung oder Constraint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Selected {
     Point(PointId),
     Entity(EntityId),
     Dimension(DimensionId),
+    Constraint(ConstraintId),
 }
 
 /// Eine über die Toolbar auslösbare Aktion für die aktuelle Selektion:
@@ -167,6 +182,9 @@ pub struct SketchSession {
     /// Letzter abgelehnter Bemaßungsversuch (Konflikt/Überbestimmung) —
     /// die UI formt daraus ihre Meldung. Wird bei Erfolg gelöscht.
     pub last_dim_error: Option<DimensionError>,
+    /// Constraint-Glyphen im Overlay anzeigen (auf dichten Skizzen
+    /// abschaltbar; Standard an).
+    pub show_constraint_glyphs: bool,
     dragging: Option<PointId>,
     /// Läuft ein Label-Drag einer Bemaßung? Ändert nur den Offset,
     /// nie die Geometrie (der Solver wird nicht angestoßen).
@@ -209,6 +227,7 @@ impl SketchSession {
             selection: Vec::new(),
             last_solve: None,
             last_dim_error: None,
+            show_constraint_glyphs: true,
             dragging: None,
             dragging_dim: None,
             saved_camera,
@@ -353,6 +372,21 @@ impl SketchSession {
         // Welche Bemaßung liegt unter dem Cursor? (Hover + Klick + Label-Drag)
         let dim_hit = mouse_screen.and_then(|p| self.dimension_at_screen(&map, p));
 
+        // Constraint-Glyph bzw. Entity unter dem Cursor — nur im Auswahl-
+        // Werkzeug relevant (Cross-Highlighting + Glyph-Selektion).
+        let select_mode = matches!(self.tool, SketchTool::Select);
+        let glyph_hit = if select_mode && self.show_constraint_glyphs {
+            mouse_screen.and_then(|p| self.glyph_at_screen(&map, p))
+        } else {
+            None
+        };
+        let entity_hover = if select_mode {
+            mouse_plane.and_then(|pos| self.sketch.hit_test(pos, map.px_to_plane(SELECT_TOL_PX)))
+        } else {
+            None
+        };
+        let highlight = self.hover_highlight(glyph_hit, entity_hover);
+
         // Snapping auf existierende Endpunkte (nur in Zeichenwerkzeugen)
         let snap = match (&self.tool, mouse_plane) {
             (SketchTool::Select, _) | (_, None) => None,
@@ -410,7 +444,14 @@ impl SketchSession {
         } else if let Some(pos) = mouse_plane {
             if response.clicked() {
                 let shift = ui.input(|i| i.modifiers.shift);
-                self.on_click(pos, snap, dim_hit, map.px_to_plane(SELECT_TOL_PX), shift);
+                self.on_click(
+                    pos,
+                    snap,
+                    dim_hit,
+                    glyph_hit,
+                    map.px_to_plane(SELECT_TOL_PX),
+                    shift,
+                );
             }
         }
 
@@ -425,26 +466,47 @@ impl SketchSession {
                 }
             }
             if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
+                let mut mutated = false;
                 for item in std::mem::take(&mut self.selection) {
                     match item {
-                        Selected::Entity(id) => self.sketch.delete_entity(id),
+                        Selected::Entity(id) => {
+                            self.sketch.delete_entity(id);
+                            mutated = true;
+                        }
                         // Bemaßung löschen entfernt auch ihren treibenden
                         // Constraint (Kaskade in rustcad-sketch).
-                        Selected::Dimension(id) => self.sketch.remove_dimension(id),
+                        Selected::Dimension(id) => {
+                            self.sketch.remove_dimension(id);
+                            mutated = true;
+                        }
+                        // Constraint löschen: treibt er eine Bemaßung, fällt
+                        // diese mit weg (Kaskade); sonst wird nur die
+                        // Beziehung gelöst und die Geometrie freigegeben.
+                        Selected::Constraint(id) => {
+                            self.sketch.delete_constraint(id);
+                            mutated = true;
+                        }
                         Selected::Point(_) => {}
                     }
+                }
+                if mutated {
+                    // Neu lösen: aktualisiert die Geometrie und (über dof())
+                    // die Freiheitsgrad-Anzeige.
+                    self.last_solve = Some(self.sketch.solve());
                 }
             }
         });
 
-        self.paint(ui, rect, &map, mouse_plane, snap, dim_hit);
+        self.paint(ui, rect, &map, mouse_plane, snap, dim_hit, &highlight);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn on_click(
         &mut self,
         mouse: [f64; 2],
         snap: Option<(PointId, [f64; 2])>,
         dim_hit: Option<DimensionId>,
+        glyph_hit: Option<ConstraintId>,
         select_tol: f64,
         shift: bool,
     ) {
@@ -461,11 +523,14 @@ impl SketchSession {
 
         match &mut self.tool {
             SketchTool::Select => {
-                // Priorität: Punkte > Bemaßungen > Entities
+                // Priorität: Punkte > Constraint-Glyphen > Bemaßungen > Entities.
+                // Glyphen sitzen versetzt neben der Geometrie, kollidieren also
+                // kaum mit dem Entity-Treffer an gleicher Stelle.
                 let hit = self
                     .sketch
                     .nearest_point(mouse, select_tol)
                     .map(|(id, _)| Selected::Point(id))
+                    .or(glyph_hit.map(Selected::Constraint))
                     .or(dim_hit.map(Selected::Dimension))
                     .or_else(|| {
                         self.sketch
@@ -752,6 +817,7 @@ impl SketchSession {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn paint(
         &self,
         ui: &egui::Ui,
@@ -760,6 +826,7 @@ impl SketchSession {
         mouse_plane: Option<[f64; 2]>,
         snap: Option<(PointId, [f64; 2])>,
         dim_hit: Option<DimensionId>,
+        highlight: &HoverHighlight,
     ) {
         let painter = ui.painter_at(rect);
 
@@ -767,6 +834,8 @@ impl SketchSession {
         for (id, entity) in self.sketch.entities() {
             let color = if self.selection.contains(&Selected::Entity(id)) {
                 COLOR_SELECTED
+            } else if highlight.entities.contains(&id) {
+                COLOR_HIGHLIGHT
             } else {
                 COLOR_ENTITY
             };
@@ -799,11 +868,16 @@ impl SketchSession {
         for (id, pos) in self.sketch.points() {
             let (radius, color) = if self.selection.contains(&Selected::Point(id)) {
                 (4.5, COLOR_SELECTED)
+            } else if highlight.points.contains(&id) {
+                (4.5, COLOR_HIGHLIGHT)
             } else {
                 (3.0, COLOR_POINT)
             };
             painter.circle_filled(map.plane_to_screen(pos), radius, color);
         }
+
+        // Constraint-Glyphen (über allem — kleine Icons neben der Geometrie)
+        self.paint_glyphs(&painter, map, highlight);
 
         // Werkzeug-Vorschau (Gummiband)
         if let Some(mouse) = mouse_plane {
@@ -995,6 +1069,211 @@ impl SketchSession {
             }
         }
         best.map(|(id, _)| id)
+    }
+
+    /// Cross-Highlighting in beide Richtungen: ein gehoverter Glyph hebt die
+    /// referenzierte Geometrie hervor, ein gehovertes Entity seine Glyphen.
+    fn hover_highlight(
+        &self,
+        glyph_hit: Option<ConstraintId>,
+        entity_hover: Option<EntityId>,
+    ) -> HoverHighlight {
+        let mut h = HoverHighlight::default();
+        if let Some(id) = glyph_hit {
+            h.glyphs.push(id);
+            if let Some(info) = self.sketch.constraint_info(id) {
+                for r in info.refs {
+                    match r {
+                        ConstraintRef::Point(p) => h.points.push(p),
+                        ConstraintRef::Entity(e) => h.entities.push(e),
+                    }
+                }
+            }
+        }
+        if let Some(e) = entity_hover {
+            h.glyphs
+                .extend(self.sketch.constraints_on(ConstraintRef::Entity(e)));
+        }
+        h
+    }
+
+    /// Screen-Space-Position + Symbol jedes anzuzeigenden Constraint-Glyphs.
+    /// Glyphen desselben Ankers werden gestapelt (kein Überlappen).
+    /// Distance/Radius-Constraints bekommen keinen Glyph — sie erscheinen
+    /// bereits als Bemaßungs-Annotation.
+    fn constraint_glyphs(&self, map: &PlaneMap) -> Vec<Glyph> {
+        let mut used: HashMap<ConstraintRef, u32> = HashMap::new();
+        let mut out = Vec::new();
+        for (id, _) in self.sketch.constraints() {
+            let Some(info) = self.sketch.constraint_info(id) else {
+                continue;
+            };
+            // Bemaßungs-getriebene Constraints zeigt schon die Annotation.
+            if info.dimension.is_some() {
+                continue;
+            }
+            let Some(symbol) = constraint_glyph(info.kind) else {
+                continue;
+            };
+            let Some(&anchor) = info.refs.first() else {
+                continue;
+            };
+            let Some(pos) = self.ref_position(anchor) else {
+                continue;
+            };
+            let slot = used.entry(anchor).or_insert(0);
+            let base = map.plane_to_screen(pos) + GLYPH_OFFSET_PX;
+            let center = base + egui::vec2((GLYPH_SIZE_PX + GLYPH_GAP_PX) * *slot as f32, 0.0);
+            *slot += 1;
+            out.push(Glyph { id, symbol, center });
+        }
+        out
+    }
+
+    /// Ankerposition eines referenzierten Elements in Ebenen-Koordinaten
+    /// (Punkt bzw. Linienmitte/Kreismittelpunkt).
+    fn ref_position(&self, r: ConstraintRef) -> Option<[f64; 2]> {
+        match r {
+            ConstraintRef::Point(p) => self
+                .sketch
+                .points()
+                .find(|(id, _)| *id == p)
+                .map(|(_, pos)| pos),
+            ConstraintRef::Entity(e) => match self.sketch.entity(e)? {
+                SketchEntity::Line { p1, p2 } => {
+                    let a = self.sketch.point_pos(*p1);
+                    let b = self.sketch.point_pos(*p2);
+                    Some([(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5])
+                }
+                SketchEntity::Circle { center, .. } => Some(self.sketch.point_pos(*center)),
+            },
+        }
+    }
+
+    /// Constraint-Glyph unter dem Bildschirm-Cursor (falls sichtbar).
+    fn glyph_at_screen(&self, map: &PlaneMap, cursor: Pos2) -> Option<ConstraintId> {
+        let mut best: Option<(ConstraintId, f32)> = None;
+        for g in self.constraint_glyphs(map) {
+            let rect = Rect::from_center_size(g.center, Vec2::splat(GLYPH_SIZE_PX));
+            if rect.contains(cursor) {
+                let d = (g.center - cursor).length();
+                if best.is_none_or(|(_, bd)| d < bd) {
+                    best = Some((g.id, d));
+                }
+            }
+        }
+        best.map(|(id, _)| id)
+    }
+
+    /// Zeichnet die Constraint-Glyphen als kleine Chips (Screen-Space).
+    fn paint_glyphs(&self, painter: &egui::Painter, map: &PlaneMap, highlight: &HoverHighlight) {
+        if !self.show_constraint_glyphs {
+            return;
+        }
+        for g in self.constraint_glyphs(map) {
+            let selected = self.selection.contains(&Selected::Constraint(g.id));
+            let hot = highlight.glyphs.contains(&g.id);
+            let color = if selected {
+                COLOR_SELECTED
+            } else if hot {
+                COLOR_GLYPH_HOVER
+            } else {
+                COLOR_GLYPH
+            };
+            let rect = Rect::from_center_size(g.center, Vec2::splat(GLYPH_SIZE_PX));
+            painter.rect_filled(rect, 3.0, COLOR_DIM_LABEL_BG);
+            if selected || hot {
+                painter.rect_stroke(rect, 3.0, Stroke::new(1.0, color), egui::StrokeKind::Inside);
+            }
+            painter.text(
+                g.center,
+                egui::Align2::CENTER_CENTER,
+                g.symbol,
+                FontId::proportional(GLYPH_SIZE_PX * 0.72),
+                color,
+            );
+        }
+    }
+
+    /// Beschreibung des (einzeln) selektierten Constraints für die
+    /// Statuszeile: Art + referenzierte Geometrie. `None`, wenn kein
+    /// Constraint selektiert ist.
+    pub fn selected_constraint_text(&self) -> Option<String> {
+        self.selection.iter().find_map(|s| match s {
+            Selected::Constraint(id) => self.describe_constraint(*id),
+            _ => None,
+        })
+    }
+
+    fn describe_constraint(&self, id: ConstraintId) -> Option<String> {
+        let info = self.sketch.constraint_info(id)?;
+        let lines = info
+            .refs
+            .iter()
+            .filter(|r| matches!(r, ConstraintRef::Entity(_)))
+            .count();
+        let points = info.refs.len() - lines;
+        let mut parts = Vec::new();
+        if lines > 0 {
+            parts.push(format!("{lines} Linie{}", if lines == 1 { "" } else { "n" }));
+        }
+        if points > 0 {
+            parts.push(format!(
+                "{points} Punkt{}",
+                if points == 1 { "" } else { "e" }
+            ));
+        }
+        Some(format!(
+            "{} · {}",
+            constraint_kind_label(info.kind),
+            parts.join(", ")
+        ))
+    }
+}
+
+/// Highlight-Zustand fürs Cross-Highlighting (leer = nichts hervorheben).
+#[derive(Default)]
+struct HoverHighlight {
+    /// Hervorzuhebende Entities (aus einem gehoverten Glyph).
+    entities: Vec<EntityId>,
+    /// Hervorzuhebende Punkte (aus einem gehoverten Glyph).
+    points: Vec<PointId>,
+    /// Hervorzuhebende Glyphen (aus gehovertem Entity oder Glyph).
+    glyphs: Vec<ConstraintId>,
+}
+
+/// Ein platzierter Constraint-Glyph im Screen-Space.
+struct Glyph {
+    id: ConstraintId,
+    symbol: &'static str,
+    center: Pos2,
+}
+
+/// Symbol eines Constraint-Glyphs; `None` für werthafte Constraints
+/// (Distance/Radius), die bereits als Bemaßung erscheinen.
+fn constraint_glyph(kind: ConstraintKind) -> Option<&'static str> {
+    Some(match kind {
+        ConstraintKind::Coincident => "●",
+        ConstraintKind::Horizontal => "H",
+        ConstraintKind::Vertical => "V",
+        ConstraintKind::Parallel => "∥",
+        ConstraintKind::Perpendicular => "⊥",
+        ConstraintKind::Equal => "=",
+        ConstraintKind::Distance | ConstraintKind::Radius => return None,
+    })
+}
+
+/// Deutscher Anzeigename einer Constraint-Art.
+fn constraint_kind_label(kind: ConstraintKind) -> &'static str {
+    match kind {
+        ConstraintKind::Coincident => "Koinzident",
+        ConstraintKind::Horizontal => "Horizontal",
+        ConstraintKind::Vertical => "Vertikal",
+        ConstraintKind::Parallel => "Parallel",
+        ConstraintKind::Perpendicular => "Senkrecht",
+        ConstraintKind::Distance => "Abstand",
+        ConstraintKind::Radius => "Radius",
+        ConstraintKind::Equal => "Gleich lang",
     }
 }
 
@@ -1411,6 +1690,117 @@ mod tests {
         session.sketch.set_dimension_value(dia, 12.0).expect("edit");
         let tol = 1e-4;
         assert!((session.sketch.circle_radius(circle2).unwrap() - 6.0).abs() < tol);
+    }
+
+    /// Akzeptanz 1: geometrische Constraints bekommen je einen Glyph;
+    /// mehrere am selben Anker stapeln sich überlappungsfrei.
+    #[test]
+    fn geometric_constraints_get_stacking_glyphs() {
+        let mut camera = OrbitCamera::default();
+        let mut session = SketchSession::start(SketchPlane::XY, &mut camera);
+        let a = session.sketch.add_point([0.0, 0.0]);
+        let b = session.sketch.add_point([10.0, 0.0]);
+        let c = session.sketch.add_point([0.0, 5.0]);
+        let d = session.sketch.add_point([10.0, 5.0]);
+        let l1 = session.sketch.add_line(a, b);
+        let l2 = session.sketch.add_line(c, d);
+        session.sketch.add_constraint(Constraint::Horizontal(l1)).unwrap();
+        session.sketch.add_constraint(Constraint::Parallel(l1, l2)).unwrap();
+        session.sketch.add_constraint(Constraint::Equal(l1, l2)).unwrap();
+        session.sketch.add_constraint(Constraint::Coincident(a, c)).unwrap();
+
+        let map = PlaneMap::new(SketchPlane::XY, &camera, viewport());
+        let glyphs = session.constraint_glyphs(&map);
+        // Vier Glyphen (H, ∥, =, ●).
+        assert_eq!(glyphs.len(), 4);
+        // H/∥/= ankern an l1 (gestapelt), ● an Punkt a — keine zwei decken
+        // sich, der Stapel läuft überlappungsfrei nebeneinander.
+        let centers: Vec<_> = glyphs.iter().map(|g| g.center).collect();
+        for i in 0..centers.len() {
+            for j in (i + 1)..centers.len() {
+                assert!(
+                    (centers[i] - centers[j]).length() >= GLYPH_SIZE_PX,
+                    "Glyphen überlappen: {:?} vs {:?}",
+                    centers[i],
+                    centers[j]
+                );
+            }
+        }
+    }
+
+    /// Ein von einer Bemaßung getriebener Distance-Constraint bekommt keinen
+    /// Glyph (die Bemaßungs-Annotation zeigt die Beziehung schon).
+    #[test]
+    fn dimension_driven_constraint_shows_no_glyph() {
+        let (session, camera, _dim) = linear_session();
+        let map = PlaneMap::new(SketchPlane::XY, &camera, viewport());
+        assert!(session.constraint_glyphs(&map).is_empty());
+    }
+
+    /// Akzeptanz 1: Cross-Highlighting funktioniert in beide Richtungen.
+    #[test]
+    fn glyph_hover_cross_highlights_in_both_directions() {
+        let mut camera = OrbitCamera::default();
+        let mut session = SketchSession::start(SketchPlane::XY, &mut camera);
+        let a = session.sketch.add_point([0.0, 0.0]);
+        let b = session.sketch.add_point([10.0, 0.0]);
+        let l1 = session.sketch.add_line(a, b);
+        session.sketch.add_constraint(Constraint::Horizontal(l1)).unwrap();
+
+        let map = PlaneMap::new(SketchPlane::XY, &camera, viewport());
+        let glyphs = session.constraint_glyphs(&map);
+        assert_eq!(glyphs.len(), 1);
+        let cid = glyphs[0].id;
+
+        // Glyph unter seinem eigenen Zentrum getroffen.
+        assert_eq!(session.glyph_at_screen(&map, glyphs[0].center), Some(cid));
+        // Glyph-Hover → referenzierte Linie hervorgehoben.
+        let h = session.hover_highlight(Some(cid), None);
+        assert!(h.entities.contains(&l1));
+        assert!(h.glyphs.contains(&cid));
+        // Entity-Hover → sein Glyph hervorgehoben (Gegenrichtung).
+        let h2 = session.hover_highlight(None, Some(l1));
+        assert!(h2.glyphs.contains(&cid));
+    }
+
+    /// Akzeptanz 2: einen Constraint löschen entfernt seinen Glyph.
+    #[test]
+    fn deleting_constraint_removes_its_glyph() {
+        let mut camera = OrbitCamera::default();
+        let mut session = SketchSession::start(SketchPlane::XY, &mut camera);
+        let a = session.sketch.add_point([0.0, 0.0]);
+        let b = session.sketch.add_point([10.0, 0.0]);
+        let c = session.sketch.add_point([10.0, 0.0]);
+        let d = session.sketch.add_point([10.0, 8.0]);
+        let l1 = session.sketch.add_line(a, b);
+        let l2 = session.sketch.add_line(c, d);
+        let perp = session
+            .sketch
+            .add_constraint(Constraint::Perpendicular(l1, l2))
+            .unwrap();
+
+        let map = PlaneMap::new(SketchPlane::XY, &camera, viewport());
+        assert_eq!(session.constraint_glyphs(&map).len(), 1);
+        session.sketch.delete_constraint(perp);
+        assert!(session.constraint_glyphs(&map).is_empty());
+    }
+
+    #[test]
+    fn selected_constraint_text_describes_kind_and_refs() {
+        let mut camera = OrbitCamera::default();
+        let mut session = SketchSession::start(SketchPlane::XY, &mut camera);
+        let a = session.sketch.add_point([0.0, 0.0]);
+        let b = session.sketch.add_point([10.0, 0.0]);
+        let l1 = session.sketch.add_line(a, b);
+        let hor = session
+            .sketch
+            .add_constraint(Constraint::Horizontal(l1))
+            .unwrap();
+        assert!(session.selected_constraint_text().is_none());
+        session.selection = vec![Selected::Constraint(hor)];
+        let text = session.selected_constraint_text().unwrap();
+        assert!(text.contains("Horizontal"), "war {text}");
+        assert!(text.contains("1 Linie"), "war {text}");
     }
 
     #[test]

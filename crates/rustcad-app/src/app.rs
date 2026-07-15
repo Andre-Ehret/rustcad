@@ -59,6 +59,7 @@ enum ToolbarAction {
     EnterSketch(SketchPlane),
     SetTool(SketchTool),
     AddAction(sketch_mode::SketchAction),
+    ToggleGlyphs,
     FinishSketch,
     OpenExtrude,
     OpenRevolve,
@@ -490,6 +491,14 @@ impl RustcadApp {
                         }
                     }
                     ui.separator();
+                    if ui
+                        .selectable_label(session.show_constraint_glyphs, "⊥ Constraints")
+                        .on_hover_text("Constraint-Glyphen ein-/ausblenden")
+                        .clicked()
+                    {
+                        action = ToolbarAction::ToggleGlyphs;
+                    }
+                    ui.separator();
                     if ui.button("✔ Fertig").clicked() {
                         action = ToolbarAction::FinishSketch;
                     }
@@ -509,6 +518,12 @@ impl RustcadApp {
                         session.sketch.dof(),
                         status,
                     ));
+                    // Selektierter Constraint: Art + referenzierte Geometrie
+                    // (Ersatz für das im Skizzenmodus ausgeblendete Panel).
+                    if let Some(text) = session.selected_constraint_text() {
+                        ui.separator();
+                        ui.colored_label(egui::Color32::from_rgb(150, 205, 150), text);
+                    }
                     // Abgelehnter Bemaßungsversuch: konkrete Meldung als Toast.
                     if let Some(err) = session.last_dim_error {
                         ui.separator();
@@ -542,6 +557,11 @@ impl RustcadApp {
             ToolbarAction::AddAction(sketch_action) => {
                 if let AppMode::SketchEdit(session) = &mut self.mode {
                     session.apply_action(sketch_action);
+                }
+            }
+            ToolbarAction::ToggleGlyphs => {
+                if let AppMode::SketchEdit(session) = &mut self.mode {
+                    session.show_constraint_glyphs = !session.show_constraint_glyphs;
                 }
             }
             ToolbarAction::FinishSketch => {
