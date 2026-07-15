@@ -10,10 +10,12 @@
 #![warn(missing_docs)]
 
 mod constraint;
+mod dimension;
 mod profiles;
 mod solver;
 
 pub use constraint::{Constraint, ConstraintError, ConstraintId};
+pub use dimension::{Dimension, DimensionId, DimensionKind, DimensionTarget};
 pub use profiles::Profile;
 pub use solver::{SolveResult, SOLVE_TOLERANCE};
 
@@ -72,6 +74,10 @@ pub struct Sketch {
     points: SlotMap<PointId, SketchPoint>,
     entities: SlotMap<EntityId, SketchEntity>,
     constraints: SlotMap<ConstraintId, Constraint>,
+    /// Bemaßungen (Präsentationsschicht über den treibenden Constraints).
+    /// `default` für Rückwärtskompatibilität mit `format_version` 1.
+    #[serde(default)]
+    dimensions: SlotMap<DimensionId, Dimension>,
 }
 
 impl Sketch {
@@ -199,6 +205,8 @@ impl Sketch {
         for c in invalid {
             self.constraints.remove(c);
         }
+        // Bemaßungen, deren treibender Constraint gerade wegfiel, mitentfernen.
+        self.prune_dangling_dimensions();
     }
 
     /// Fügt einen Constraint hinzu (validiert die Referenzen).
@@ -208,9 +216,11 @@ impl Sketch {
         Ok(self.constraints.insert(c))
     }
 
-    /// Entfernt einen Constraint.
+    /// Entfernt einen Constraint. Eine daran hängende Bemaßung
+    /// (die ihn als treibenden Constraint referenziert) fällt mit weg.
     pub fn delete_constraint(&mut self, id: ConstraintId) {
         self.constraints.remove(id);
+        self.prune_dangling_dimensions();
     }
 
     /// Alle Constraints.
