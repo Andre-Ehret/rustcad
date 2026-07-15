@@ -29,8 +29,16 @@ einer nativen Desktop-App (egui + wgpu) auf dem B-Rep-Kernel
 
 Benötigt wird ein aktuelles stabiles Rust (≥ 1.85, [rustup](https://rustup.rs)).
 
+App starten (Debug — schneller Build, ausreichend dank optimierter Abhängigkeiten):
+
 ```bash
 cargo run -p rustcad-app
+```
+
+Für flüssigere Tessellierung/Rendering als Release-Build:
+
+```bash
+cargo run --release -p rustcad-app
 ```
 
 ## Bedienung
