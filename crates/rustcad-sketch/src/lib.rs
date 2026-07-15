@@ -12,11 +12,13 @@
 mod constraint;
 mod dimension;
 mod profiles;
+mod query;
 mod solver;
 
 pub use constraint::{Constraint, ConstraintError, ConstraintId};
 pub use dimension::{Dimension, DimensionError, DimensionId, DimensionKind, DimensionTarget};
 pub use profiles::Profile;
+pub use query::{ConstraintInfo, ConstraintKind, ConstraintRef};
 pub use solver::{SolveResult, SOLVE_TOLERANCE};
 
 use serde::{Deserialize, Serialize};
