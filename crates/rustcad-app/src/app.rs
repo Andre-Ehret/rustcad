@@ -454,6 +454,7 @@ impl RustcadApp {
                         SketchTool::Select,
                         SketchTool::Line { start: None },
                         SketchTool::Circle { center: None },
+                        SketchTool::dimension(),
                     ];
                     for tool in tools {
                         let active =
