@@ -2,7 +2,7 @@ use egui::{Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use glam::{Mat4, Vec3};
 use rustcad_core::{FeatureId, SketchPlane};
 use rustcad_sketch::{
-    Constraint, DimensionId, DimensionKind, DimensionTarget, EntityId, PointId, Sketch,
+    Constraint, Dimension, DimensionId, DimensionKind, DimensionTarget, EntityId, PointId, Sketch,
     SketchEntity, SolveResult,
 };
 
@@ -59,14 +59,41 @@ pub enum SketchTool {
     Select,
     Line { start: Option<PendingPoint> },
     Circle { center: Option<PendingPoint> },
+    /// Bemaßungswerkzeug (Zustandsautomat, siehe [`DimStage`]).
+    Dimension(DimStage),
+}
+
+/// Zustandsautomat des Bemaßungswerkzeugs (TECH_SPEC §7.4, keine
+/// impliziten Modi): Auswahl → Platzieren → Werteingabe.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DimStage {
+    /// Warten auf Geometrieauswahl. `first_point` ist gesetzt, wenn für
+    /// eine Punkt-zu-Punkt-Bemaßung bereits ein Punkt geklickt wurde.
+    Selecting { first_point: Option<PointId> },
+    /// Ziel steht fest; das Label folgt der Maus, ein Klick platziert es.
+    Placing { target: DimensionTarget },
+    /// Label platziert; Zahleneingabe läuft (Feld direkt am Label).
+    Editing {
+        target: DimensionTarget,
+        offset: [f64; 2],
+        text: String,
+        /// Beim ersten Frame den Fokus ins Eingabefeld setzen.
+        focus: bool,
+    },
 }
 
 impl SketchTool {
+    /// Frischer, leerer Zustand des Bemaßungswerkzeugs.
+    pub fn dimension() -> Self {
+        SketchTool::Dimension(DimStage::Selecting { first_point: None })
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             SketchTool::Select => "Auswählen",
             SketchTool::Line { .. } => "Linie",
             SketchTool::Circle { .. } => "Kreis",
+            SketchTool::Dimension(_) => "Bemaßung",
         }
     }
 
@@ -79,10 +106,20 @@ impl SketchTool {
 
     fn clear_pending(&mut self) {
         match self {
-            SketchTool::Select => {}
+            SketchTool::Select | SketchTool::Dimension(_) => {}
             SketchTool::Line { start } => *start = None,
             SketchTool::Circle { center } => *center = None,
         }
+    }
+}
+
+/// Wechselt bei Kreis-Bemaßungen zwischen Durchmesser und Radius;
+/// lineare Ziele bleiben unverändert.
+fn toggle_circle_target(target: DimensionTarget) -> DimensionTarget {
+    match target {
+        DimensionTarget::Diameter(e) => DimensionTarget::Radius(e),
+        DimensionTarget::Radius(e) => DimensionTarget::Diameter(e),
+        linear => linear,
     }
 }
 
@@ -336,7 +373,11 @@ impl SketchSession {
             }
         }
 
-        if let Some(pos) = mouse_plane {
+        // Das Bemaßungswerkzeug hat einen eigenen Zustandsautomaten und
+        // verarbeitet Klicks, R (Umschalten ⌀/R), Enter/Esc selbst.
+        if matches!(self.tool, SketchTool::Dimension(_)) {
+            self.handle_dimension_tool(ui, response, &map, mouse_plane, map.px_to_plane(SELECT_TOL_PX));
+        } else if let Some(pos) = mouse_plane {
             if response.clicked() {
                 let shift = ui.input(|i| i.modifiers.shift);
                 self.on_click(pos, snap, dim_hit, map.px_to_plane(SELECT_TOL_PX), shift);
@@ -344,7 +385,8 @@ impl SketchSession {
         }
 
         ui.input(|i| {
-            if i.key_pressed(egui::Key::Escape) {
+            // Escape des Bemaßungswerkzeugs ist in handle_dimension_tool behandelt.
+            if i.key_pressed(egui::Key::Escape) && !matches!(self.tool, SketchTool::Dimension(_)) {
                 if self.tool.has_pending() {
                     self.tool.clear_pending();
                 } else {
@@ -442,6 +484,206 @@ impl SketchSession {
                     }
                 }
             },
+            // Das Bemaßungswerkzeug wird separat behandelt.
+            SketchTool::Dimension(_) => {}
+        }
+    }
+
+    /// Zustandsautomat des Bemaßungswerkzeugs. Verarbeitet Auswahl,
+    /// Platzierung und Werteingabe; Esc verlässt jeden Zwischenzustand.
+    fn handle_dimension_tool(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        map: &PlaneMap,
+        mouse_plane: Option<[f64; 2]>,
+        select_tol: f64,
+    ) {
+        let SketchTool::Dimension(stage) = &self.tool else {
+            return;
+        };
+        let stage = stage.clone();
+        let clicked = response.clicked();
+        let (enter, esc, toggle) = ui.input(|i| {
+            (
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::R),
+            )
+        });
+
+        let next = match stage {
+            DimStage::Selecting { first_point } => {
+                if esc {
+                    // Leerer Zustand: Werkzeug verlassen.
+                    self.selection.clear();
+                    SketchTool::Select
+                } else if clicked {
+                    match mouse_plane {
+                        Some(pos) => {
+                            SketchTool::Dimension(self.dim_pick(first_point, pos, select_tol))
+                        }
+                        None => SketchTool::Dimension(DimStage::Selecting { first_point }),
+                    }
+                } else {
+                    SketchTool::Dimension(DimStage::Selecting { first_point })
+                }
+            }
+            DimStage::Placing { target } => {
+                let target = if toggle {
+                    toggle_circle_target(target)
+                } else {
+                    target
+                };
+                if esc {
+                    // Esc verlässt das Werkzeug aus jedem Auswahl-/Platzier-
+                    // Zustand (Werteingabe hat eigene Esc-Semantik).
+                    self.selection.clear();
+                    SketchTool::Select
+                } else if clicked {
+                    match mouse_plane {
+                        Some(pos) => {
+                            let r = self.target_reference(target);
+                            let offset = [pos[0] - r[0], pos[1] - r[1]];
+                            let value = self.measured_value(target);
+                            SketchTool::Dimension(DimStage::Editing {
+                                target,
+                                offset,
+                                text: format!("{value:.4}"),
+                                focus: true,
+                            })
+                        }
+                        None => SketchTool::Dimension(DimStage::Placing { target }),
+                    }
+                } else {
+                    SketchTool::Dimension(DimStage::Placing { target })
+                }
+            }
+            DimStage::Editing {
+                target,
+                offset,
+                mut text,
+                focus,
+            } => {
+                let measured = self.measured_value(target);
+                let label_pos = {
+                    let r = self.target_reference(target);
+                    map.plane_to_screen([r[0] + offset[0], r[1] + offset[1]])
+                };
+                // Eingabefeld direkt am Label.
+                let mut confirm_typed = false;
+                egui::Area::new(egui::Id::new("rustcad-dim-input"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(label_pos)
+                    .show(ui.ctx(), |ui| {
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut text)
+                                .desired_width(70.0)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        if focus {
+                            resp.request_focus();
+                        }
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            confirm_typed = true;
+                        }
+                    });
+
+                // Enter bestätigt den eingegebenen Wert, Esc übernimmt den
+                // aktuellen (gemessenen) Wert — beide fixieren die Bemaßung.
+                let value = if confirm_typed || enter {
+                    Some(text.trim().parse::<f64>().unwrap_or(measured))
+                } else if esc {
+                    Some(measured)
+                } else {
+                    None
+                };
+
+                match value {
+                    Some(v) => {
+                        if self.sketch.add_dimension(target, v, offset).is_ok() {
+                            self.last_solve = Some(self.sketch.solve());
+                        }
+                        SketchTool::dimension()
+                    }
+                    None => SketchTool::Dimension(DimStage::Editing {
+                        target,
+                        offset,
+                        text,
+                        focus: false,
+                    }),
+                }
+            }
+        };
+        self.tool = next;
+    }
+
+    /// Auflösung eines Auswahlklicks im Bemaßungswerkzeug. Priorität beim
+    /// ersten Klick: Punkt (→ Punkt-zu-Punkt) > Kreis (→ ⌀) > Linie
+    /// (→ Länge). Ungültige Klicks setzen die Auswahl sauber zurück.
+    fn dim_pick(&self, first_point: Option<PointId>, pos: [f64; 2], tol: f64) -> DimStage {
+        match first_point {
+            Some(p) => {
+                if let Some((q, _)) = self.sketch.nearest_point(pos, tol) {
+                    if q != p {
+                        return DimStage::Placing {
+                            target: DimensionTarget::Linear(p, q),
+                        };
+                    }
+                }
+                // Kein gültiger zweiter Punkt: Auswahl zurücksetzen.
+                DimStage::Selecting { first_point: None }
+            }
+            None => {
+                if let Some((p, _)) = self.sketch.nearest_point(pos, tol) {
+                    return DimStage::Selecting {
+                        first_point: Some(p),
+                    };
+                }
+                if let Some(e) = self.sketch.hit_test(pos, tol) {
+                    if self.sketch.circle_radius(e).is_some() {
+                        return DimStage::Placing {
+                            target: DimensionTarget::Diameter(e),
+                        };
+                    }
+                    if let Some(SketchEntity::Line { p1, p2 }) = self.sketch.entity(e) {
+                        return DimStage::Placing {
+                            target: DimensionTarget::Linear(*p1, *p2),
+                        };
+                    }
+                }
+                DimStage::Selecting { first_point: None }
+            }
+        }
+    }
+
+    /// Aktuell gemessener Anzeigewert eines Bemaßungsziels
+    /// (Länge, Radius bzw. Durchmesser = 2r).
+    fn measured_value(&self, target: DimensionTarget) -> f64 {
+        match target {
+            DimensionTarget::Linear(p, q) => {
+                dist2(self.sketch.point_pos(p), self.sketch.point_pos(q)).sqrt()
+            }
+            DimensionTarget::Radius(e) => self.sketch.circle_radius(e).unwrap_or(0.0),
+            DimensionTarget::Diameter(e) => 2.0 * self.sketch.circle_radius(e).unwrap_or(0.0),
+        }
+    }
+
+    /// Referenzpunkt eines Ziels in Ebenen-Koordinaten (Segmentmitte
+    /// bzw. Kreismittelpunkt) — Basis für den relativen Label-Offset.
+    fn target_reference(&self, target: DimensionTarget) -> [f64; 2] {
+        match target {
+            DimensionTarget::Linear(p, q) => {
+                let a = self.sketch.point_pos(p);
+                let b = self.sketch.point_pos(q);
+                [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5]
+            }
+            DimensionTarget::Radius(e) | DimensionTarget::Diameter(e) => {
+                match self.sketch.entity(e) {
+                    Some(SketchEntity::Circle { center, .. }) => self.sketch.point_pos(*center),
+                    _ => [0.0, 0.0],
+                }
+            }
         }
     }
 
@@ -525,6 +767,33 @@ impl SketchSession {
                         4.0,
                     ));
                 }
+                // Punkt-zu-Punkt: gewählten Startpunkt markieren + Gummiband.
+                SketchTool::Dimension(DimStage::Selecting {
+                    first_point: Some(p),
+                }) => {
+                    let a = map.plane_to_screen(self.sketch.point_pos(*p));
+                    painter.circle_filled(a, 4.5, COLOR_SELECTED);
+                    painter.extend(egui::Shape::dashed_line(
+                        &[a, map.plane_to_screen(mouse)],
+                        preview,
+                        6.0,
+                        4.0,
+                    ));
+                }
+                // Platzieren: Vorschau der Bemaßung folgt der Maus.
+                SketchTool::Dimension(DimStage::Placing { target }) => {
+                    let r = self.target_reference(*target);
+                    let offset = [mouse[0] - r[0], mouse[1] - r[1]];
+                    let value = self.measured_value(*target);
+                    let geom = self.dim_geom_from(map, *target, offset, value);
+                    draw_dim_geom(&painter, &geom, COLOR_DIM_HOVER, true);
+                }
+                // Werteingabe: Maßlinien anzeigen (Label deckt das Feld ab).
+                SketchTool::Dimension(DimStage::Editing { target, offset, .. }) => {
+                    let value = self.measured_value(*target);
+                    let geom = self.dim_geom_from(map, *target, *offset, value);
+                    draw_dim_geom(&painter, &geom, COLOR_DIM_HOVER, false);
+                }
                 _ => {}
             }
         }
@@ -549,30 +818,44 @@ impl SketchSession {
             } else {
                 COLOR_DIM
             };
-            let stroke = Stroke::new(1.4, color);
-            for seg in &geom.lines {
-                painter.line_segment(*seg, stroke);
-            }
-            for &(tip, dir) in &geom.arrows {
-                draw_arrowhead(painter, tip, dir, color);
-            }
-            // Wert-Label mit dezentem Hintergrund für Lesbarkeit.
-            let galley =
-                painter.layout_no_wrap(geom.text, FontId::proportional(DIM_FONT_PX), color);
-            let bg = Rect::from_center_size(geom.label, galley.size() + egui::vec2(6.0, 2.0));
-            painter.rect_filled(bg, 3.0, COLOR_DIM_LABEL_BG);
-            painter.galley(geom.label - galley.size() * 0.5, galley, color);
+            draw_dim_geom(painter, &geom, color, true);
         }
     }
 
-    /// Screen-Space-Geometrie einer Bemaßung (Linien, Pfeile, Label).
+    /// Das Bemaßungsziel einer bestehenden Bemaßung (aus ihrem treibenden
+    /// Constraint plus Art), oder `None` bei ungültigen Referenzen.
+    fn dim_target(&self, dim: &Dimension) -> Option<DimensionTarget> {
+        match *self.sketch.constraint(dim.constraint)? {
+            Constraint::Distance(p, q, _) => Some(DimensionTarget::Linear(p, q)),
+            Constraint::Radius(e, _) => Some(match dim.kind {
+                DimensionKind::Diameter => DimensionTarget::Diameter(e),
+                _ => DimensionTarget::Radius(e),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Screen-Space-Geometrie einer bestehenden Bemaßung.
     /// `None`, falls der treibende Constraint/Referenzen ungültig sind.
     fn dim_screen_geom(&self, map: &PlaneMap, id: DimensionId) -> Option<DimGeom> {
         let dim = self.sketch.dimension(id)?;
+        let target = self.dim_target(dim)?;
         let value = self.sketch.dimension_value(id)?;
-        let o = dim.offset;
-        match *self.sketch.constraint(dim.constraint)? {
-            Constraint::Distance(p, q, _) => {
+        Some(self.dim_geom_from(map, target, dim.offset, value))
+    }
+
+    /// Baut die Screen-Space-Geometrie aus Ziel + Offset + Anzeigewert.
+    /// Basis für bestehende Bemaßungen *und* die Live-Vorschau des
+    /// Bemaßungswerkzeugs (setzt ein gültiges Ziel voraus).
+    fn dim_geom_from(
+        &self,
+        map: &PlaneMap,
+        target: DimensionTarget,
+        o: [f64; 2],
+        value: f64,
+    ) -> DimGeom {
+        match target {
+            DimensionTarget::Linear(p, q) => {
                 let a = self.sketch.point_pos(p);
                 let b = self.sketch.point_pos(q);
                 let sa = map.plane_to_screen(a);
@@ -582,20 +865,20 @@ impl SketchSession {
                 let dir = safe_dir(db - da);
                 let perp = egui::vec2(-dir.y, dir.x);
                 let mid = da + (db - da) * 0.5;
-                Some(DimGeom {
+                DimGeom {
                     // Maßlinie + zwei Maßhilfslinien zu den Endpunkten.
                     lines: vec![[sa, da], [sb, db], [da, db]],
                     arrows: vec![(da, -dir), (db, dir)],
                     label: mid + perp * (DIM_FONT_PX * 0.5 + 3.0),
                     text: format_dimension(value),
-                })
+                }
             }
-            Constraint::Radius(e, _) => {
-                let center = match self.sketch.entity(e)? {
-                    SketchEntity::Circle { center, .. } => self.sketch.point_pos(*center),
-                    _ => return None,
+            DimensionTarget::Radius(e) | DimensionTarget::Diameter(e) => {
+                let center = match self.sketch.entity(e) {
+                    Some(SketchEntity::Circle { center, .. }) => self.sketch.point_pos(*center),
+                    _ => [0.0, 0.0],
                 };
-                let r = self.sketch.circle_radius(e)?;
+                let r = self.sketch.circle_radius(e).unwrap_or(0.0);
                 let olen = (o[0] * o[0] + o[1] * o[1]).sqrt();
                 let d = if olen > 1e-9 {
                     [o[0] / olen, o[1] / olen]
@@ -606,37 +889,25 @@ impl SketchSession {
                 let edge = map.plane_to_screen([center[0] + r * d[0], center[1] + r * d[1]]);
                 let label = map.plane_to_screen([center[0] + o[0], center[1] + o[1]]);
                 let sc = map.plane_to_screen(center);
-                let prefix = match dim.kind {
-                    DimensionKind::Diameter => "⌀",
-                    _ => "R",
+                let prefix = if matches!(target, DimensionTarget::Diameter(_)) {
+                    "⌀"
+                } else {
+                    "R"
                 };
-                Some(DimGeom {
+                DimGeom {
                     lines: vec![[edge, label]],
                     arrows: vec![(edge, safe_dir(sc - edge))],
                     label,
                     text: format!("{prefix}{}", format_dimension(value)),
-                })
+                }
             }
-            _ => None,
         }
     }
 
-    /// Referenzpunkt einer Bemaßung in Ebenen-Koordinaten (Segmentmitte
-    /// bzw. Kreismittelpunkt) — Basis für den relativen Label-Offset.
+    /// Referenzpunkt einer bestehenden Bemaßung in Ebenen-Koordinaten.
     fn dim_reference(&self, id: DimensionId) -> Option<[f64; 2]> {
         let dim = self.sketch.dimension(id)?;
-        match *self.sketch.constraint(dim.constraint)? {
-            Constraint::Distance(p, q, _) => {
-                let a = self.sketch.point_pos(p);
-                let b = self.sketch.point_pos(q);
-                Some([(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5])
-            }
-            Constraint::Radius(e, _) => match self.sketch.entity(e)? {
-                SketchEntity::Circle { center, .. } => Some(self.sketch.point_pos(*center)),
-                _ => None,
-            },
-            _ => None,
-        }
+        Some(self.target_reference(self.dim_target(dim)?))
     }
 
     /// Bemaßung unter dem Bildschirm-Cursor (Label-Box oder Maßlinie
@@ -672,6 +943,25 @@ struct DimGeom {
     label: Pos2,
     /// Beschrifteter Wert inkl. Präfix (`R`, `⌀`).
     text: String,
+}
+
+/// Zeichnet eine (bestehende oder Vorschau-) Bemaßungsgeometrie.
+/// `fill_label` blendet den Label-Hintergrund ein (bei der Werteingabe
+/// deckt das Eingabefeld das Label ab, dann `false`).
+fn draw_dim_geom(painter: &egui::Painter, geom: &DimGeom, color: Color32, fill_label: bool) {
+    let stroke = Stroke::new(1.4, color);
+    for seg in &geom.lines {
+        painter.line_segment(*seg, stroke);
+    }
+    for &(tip, dir) in &geom.arrows {
+        draw_arrowhead(painter, tip, dir, color);
+    }
+    let galley = painter.layout_no_wrap(geom.text.clone(), FontId::proportional(DIM_FONT_PX), color);
+    if fill_label {
+        let bg = Rect::from_center_size(geom.label, galley.size() + egui::vec2(6.0, 2.0));
+        painter.rect_filled(bg, 3.0, COLOR_DIM_LABEL_BG);
+    }
+    painter.galley(geom.label - galley.size() * 0.5, galley, color);
 }
 
 /// Zeichnet eine Pfeilspitze am `tip`, die in `dir` zeigt.
@@ -831,6 +1121,110 @@ mod tests {
     fn format_dimension_uses_fixed_decimals() {
         assert_eq!(format_dimension(15.0), "15.00");
         assert_eq!(format_dimension(12.3456), "12.35");
+    }
+
+    #[test]
+    fn toggle_switches_only_circle_targets() {
+        let mut camera = OrbitCamera::default();
+        let mut session = SketchSession::start(SketchPlane::XY, &mut camera);
+        let c = session.sketch.add_point([0.0, 0.0]);
+        let circle = session.sketch.add_circle(c, 1.0);
+        let p = session.sketch.add_point([1.0, 0.0]);
+        assert_eq!(
+            toggle_circle_target(DimensionTarget::Diameter(circle)),
+            DimensionTarget::Radius(circle)
+        );
+        assert_eq!(
+            toggle_circle_target(DimensionTarget::Radius(circle)),
+            DimensionTarget::Diameter(circle)
+        );
+        // Lineare Ziele bleiben unverändert.
+        let linear = DimensionTarget::Linear(c, p);
+        assert_eq!(toggle_circle_target(linear), linear);
+    }
+
+    #[test]
+    fn measured_values_match_geometry() {
+        let mut camera = OrbitCamera::default();
+        let mut session = SketchSession::start(SketchPlane::XY, &mut camera);
+        let p1 = session.sketch.add_point([0.0, 0.0]);
+        let p2 = session.sketch.add_point([3.0, 4.0]);
+        let c = session.sketch.add_point([0.0, 0.0]);
+        let circle = session.sketch.add_circle(c, 2.0);
+        assert_eq!(session.measured_value(DimensionTarget::Linear(p1, p2)), 5.0);
+        assert_eq!(session.measured_value(DimensionTarget::Radius(circle)), 2.0);
+        assert_eq!(
+            session.measured_value(DimensionTarget::Diameter(circle)),
+            4.0
+        );
+    }
+
+    #[test]
+    fn dim_pick_first_click_resolves_geometry() {
+        let mut camera = OrbitCamera::default();
+        let mut session = SketchSession::start(SketchPlane::XY, &mut camera);
+        let p1 = session.sketch.add_point([0.0, 0.0]);
+        let p2 = session.sketch.add_point([10.0, 0.0]);
+        let _line = session.sketch.add_line(p1, p2);
+        let cc = session.sketch.add_point([0.0, 5.0]);
+        let circle = session.sketch.add_circle(cc, 2.0);
+        let tol = 0.5;
+
+        // Klick auf die Linienmitte → Längenbemaßung.
+        assert_eq!(
+            session.dim_pick(None, [5.0, 0.0], tol),
+            DimStage::Placing {
+                target: DimensionTarget::Linear(p1, p2)
+            }
+        );
+        // Klick auf den Kreisring → Durchmesser (Default).
+        assert_eq!(
+            session.dim_pick(None, [0.0, 7.0], tol),
+            DimStage::Placing {
+                target: DimensionTarget::Diameter(circle)
+            }
+        );
+        // Klick auf einen Endpunkt → Punkt-zu-Punkt beginnt.
+        assert_eq!(
+            session.dim_pick(None, [0.0, 0.0], tol),
+            DimStage::Selecting {
+                first_point: Some(p1)
+            }
+        );
+    }
+
+    #[test]
+    fn dim_pick_second_point_forms_linear_or_resets() {
+        let mut camera = OrbitCamera::default();
+        let mut session = SketchSession::start(SketchPlane::XY, &mut camera);
+        let p1 = session.sketch.add_point([0.0, 0.0]);
+        let p2 = session.sketch.add_point([10.0, 0.0]);
+        let tol = 0.5;
+
+        // Zweiter Punkt gewählt → lineare Bemaßung.
+        assert_eq!(
+            session.dim_pick(Some(p1), [10.0, 0.0], tol),
+            DimStage::Placing {
+                target: DimensionTarget::Linear(p1, p2)
+            }
+        );
+        // Klick ins Leere → Auswahl sauber zurückgesetzt (kein Crash).
+        assert_eq!(
+            session.dim_pick(Some(p1), [5.0, 5.0], tol),
+            DimStage::Selecting { first_point: None }
+        );
+    }
+
+    #[test]
+    fn dimension_button_yields_empty_selecting_stage() {
+        assert_eq!(
+            SketchTool::dimension().label(),
+            SketchTool::Dimension(DimStage::Selecting { first_point: None }).label()
+        );
+        assert!(matches!(
+            SketchTool::dimension(),
+            SketchTool::Dimension(DimStage::Selecting { first_point: None })
+        ));
     }
 
     #[test]
