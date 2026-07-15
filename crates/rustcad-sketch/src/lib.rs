@@ -228,6 +228,11 @@ impl Sketch {
         self.constraints.iter()
     }
 
+    /// Ein einzelner Constraint; `None` bei ungültiger ID.
+    pub fn constraint(&self, id: ConstraintId) -> Option<&Constraint> {
+        self.constraints.get(id)
+    }
+
     /// Anzahl der Constraints.
     pub fn constraint_count(&self) -> usize {
         self.constraints.len()
