@@ -11,6 +11,20 @@
 //!
 //! Ein **Durchmesser** wird intern als Radius-Constraint (`value = r`)
 //! gespeichert; nur die Anzeige zeigt `⌀ = 2r` ([`Sketch::dimension_value`]).
+//!
+//! **Konfliktbehandlung** ([`Sketch::add_dimension`] /
+//! [`Sketch::set_dimension_value`]): jede Änderung wird versuchsweise
+//! angewandt und gelöst; scheitert der Solver oder wäre die Bemaßung
+//! redundant, wird die Skizze *exakt* auf den vorherigen Stand
+//! zurückgesetzt und ein strukturierter [`DimensionError`] geliefert
+//! (Guardrail 3 — keine UI-Strings in der Domäne).
+//!
+//! **v2 (nur dokumentiert):** *getriebene* Bemaßungen (Referenzmaße, die
+//! messen statt zu treiben) sind der geplante Ausweg für überbestimmte
+//! Fälle: statt eine redundante Bemaßung abzulehnen, könnte sie als reines
+//! Anzeigemaß ohne treibenden Constraint geführt werden. Bis dahin lehnt
+//! [`Sketch::add_dimension`] solche Fälle als
+//! [`DimensionError::Overconstraining`] ab.
 
 use serde::{Deserialize, Serialize};
 use slotmap::new_key_type;
@@ -20,6 +34,36 @@ use crate::{Constraint, ConstraintError, ConstraintId, EntityId, PointId, SolveR
 new_key_type! {
     /// Stabile, generationsbasierte ID einer Bemaßung.
     pub struct DimensionId;
+}
+
+/// Fehlerfälle beim Anlegen/Ändern einer Bemaßung (Guardrail 3:
+/// strukturiert, die UI formuliert daraus ihre eigene Meldung).
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+pub enum DimensionError {
+    /// Ungültige Referenz oder falscher Entity-Typ (vom Constraint).
+    #[error(transparent)]
+    Reference(#[from] ConstraintError),
+    /// Der Wert widerspricht bestehenden Constraints: der Solver findet
+    /// keine Lösung und die Bemaßung ist redundant (Rang steigt nicht).
+    #[error("Bemaßung widerspricht bestehenden Constraints (Wert {value})")]
+    Conflicting {
+        /// Der abgelehnte (angezeigte) Wert.
+        value: f64,
+    },
+    /// Redundante, aber konsistente Bemaßung: sie reduziert keine
+    /// Freiheitsgrade (Rang steigt nicht), obwohl der Solver konvergiert.
+    #[error("Bemaßung überbestimmt die Skizze (Wert {value})")]
+    Overconstraining {
+        /// Der abgelehnte (angezeigte) Wert.
+        value: f64,
+    },
+    /// Der Solver ist nicht konvergiert, ohne dass die Bemaßung als
+    /// eindeutig redundant erkennbar war (die Skizze bleibt unverändert).
+    #[error("Solver nicht konvergiert (Wert {value})")]
+    DidNotConverge {
+        /// Der abgelehnte (angezeigte) Wert.
+        value: f64,
+    },
 }
 
 /// Art der Bemaßung — bestimmt, wie der Constraint-Wert angezeigt wird.
@@ -60,19 +104,23 @@ pub enum DimensionTarget {
 }
 
 impl Sketch {
-    /// Legt eine Bemaßung samt ihrem treibenden Constraint an.
+    /// Legt eine Bemaßung samt ihrem treibenden Constraint an, löst die
+    /// Skizze und prüft auf Konflikte.
     ///
     /// `value` ist der *angezeigte* Wert: bei [`DimensionTarget::Diameter`]
     /// der Durchmesser (intern als Radius `value / 2` gespeichert), sonst
     /// der Abstand bzw. Radius. `offset` ist der Label-Offset relativ zur
-    /// Geometrie. Der Solver läuft **nicht** automatisch — [`Sketch::solve`]
-    /// aufrufen (oder später [`Sketch::set_dimension_value`]).
+    /// Geometrie.
+    ///
+    /// Scheitert der Solver oder wäre die Bemaßung redundant, wird die
+    /// Skizze **exakt** auf den vorherigen Stand zurückgesetzt und ein
+    /// [`DimensionError`] geliefert (die Skizze bleibt unverändert).
     pub fn add_dimension(
         &mut self,
         target: DimensionTarget,
         value: f64,
         offset: [f64; 2],
-    ) -> Result<DimensionId, ConstraintError> {
+    ) -> Result<DimensionId, DimensionError> {
         let (constraint, kind) = match target {
             DimensionTarget::Linear(p, q) => {
                 (Constraint::Distance(p, q, value), DimensionKind::Linear)
@@ -82,29 +130,75 @@ impl Sketch {
                 (Constraint::Radius(c, value / 2.0), DimensionKind::Diameter)
             }
         };
+        let backup = self.clone();
         let constraint = self.add_constraint(constraint)?;
-        Ok(self.dimensions.insert(Dimension {
+        let id = self.dimensions.insert(Dimension {
             constraint,
             kind,
             offset,
-        }))
+        });
+        self.commit_dimension_change(backup, constraint, value)?;
+        Ok(id)
     }
 
-    /// Ändert den (angezeigten) Wert einer Bemaßung und löst die Skizze neu.
+    /// Ändert den (angezeigten) Wert einer Bemaßung, löst neu und prüft
+    /// auf Konflikte (wie [`Sketch::add_dimension`]).
     ///
     /// Bei einer Durchmesser-Bemaßung wird intern der halbe Wert im
-    /// Radius-Constraint abgelegt. Rückgabe ist das strukturierte
-    /// [`SolveResult`]. Bei unbekannter `id` bleibt der Wert unverändert
-    /// und die Skizze wird lediglich gelöst.
-    pub fn set_dimension_value(&mut self, id: DimensionId, value: f64) -> SolveResult {
-        if let Some(dim) = self.dimensions.get(id).copied() {
-            let stored = match dim.kind {
-                DimensionKind::Diameter => value / 2.0,
-                DimensionKind::Linear | DimensionKind::Radius => value,
-            };
-            self.set_constraint_value(dim.constraint, stored);
+    /// Radius-Constraint abgelegt. Scheitert der Solver oder wird die
+    /// Bemaßung redundant, bleibt die Skizze **exakt** unverändert und es
+    /// wird ein [`DimensionError`] geliefert. Unbekannte `id` ⇒ `Ok(())`.
+    pub fn set_dimension_value(
+        &mut self,
+        id: DimensionId,
+        value: f64,
+    ) -> Result<(), DimensionError> {
+        let Some(dim) = self.dimensions.get(id).copied() else {
+            return Ok(());
+        };
+        let stored = match dim.kind {
+            DimensionKind::Diameter => value / 2.0,
+            DimensionKind::Linear | DimensionKind::Radius => value,
+        };
+        let backup = self.clone();
+        self.set_constraint_value(dim.constraint, stored);
+        self.commit_dimension_change(backup, dim.constraint, value)
+    }
+
+    /// Löst die Skizze nach einer Bemaßungsänderung und klassifiziert das
+    /// Ergebnis. Bei Ablehnung wird `backup` wiederhergestellt.
+    ///
+    /// * Solver konvergiert + `driver` erhöht den Rang ⇒ echte Bemaßung, ok.
+    /// * Solver konvergiert + Rang unverändert ⇒ redundant, aber konsistent
+    ///   ⇒ [`DimensionError::Overconstraining`].
+    /// * Solver konvergiert nicht + Rang unverändert ⇒ redundant und
+    ///   widersprüchlich ⇒ [`DimensionError::Conflicting`].
+    /// * Solver konvergiert nicht + Rang erhöht ⇒ [`DimensionError::DidNotConverge`].
+    fn commit_dimension_change(
+        &mut self,
+        backup: Sketch,
+        driver: ConstraintId,
+        value: f64,
+    ) -> Result<(), DimensionError> {
+        match self.solve() {
+            SolveResult::Solved { .. } => {
+                if self.increases_rank(driver) {
+                    Ok(())
+                } else {
+                    *self = backup;
+                    Err(DimensionError::Overconstraining { value })
+                }
+            }
+            SolveResult::DidNotConverge { .. } => {
+                let redundant = !self.increases_rank(driver);
+                *self = backup;
+                if redundant {
+                    Err(DimensionError::Conflicting { value })
+                } else {
+                    Err(DimensionError::DidNotConverge { value })
+                }
+            }
         }
-        self.solve()
     }
 
     /// Verschiebt nur das Label (Offset), ohne den Solver zu berühren.
@@ -184,6 +278,7 @@ impl Sketch {
 mod tests {
     use super::*;
     use crate::{SolveResult, SOLVE_TOLERANCE};
+    use proptest::prelude::*;
 
     fn line(s: &mut Sketch) -> (PointId, PointId) {
         let p1 = s.add_point([0.0, 0.0]);
@@ -210,8 +305,7 @@ mod tests {
             .expect("linear dimension");
         assert_eq!(s.solve(), SolveResult::Solved { iterations: 0 });
 
-        let result = s.set_dimension_value(dim, 15.0);
-        assert!(matches!(result, SolveResult::Solved { .. }));
+        s.set_dimension_value(dim, 15.0).expect("solved");
         assert!((line_length(&s, p1, p2) - 15.0).abs() < SOLVE_TOLERANCE.sqrt());
         assert_eq!(s.dimension_value(dim), Some(15.0));
         // Offset bleibt unberührt vom Solver.
@@ -226,7 +320,7 @@ mod tests {
         let dim = s
             .add_dimension(DimensionTarget::Diameter(circle), 8.0, [1.0, 1.0])
             .expect("diameter dimension");
-        s.set_dimension_value(dim, 8.0);
+        s.set_dimension_value(dim, 8.0).expect("solved");
         // Intern Radius = 4, Anzeige = 8 (Solver bis auf Toleranz).
         assert!((s.circle_radius(circle).unwrap() - 4.0).abs() < SOLVE_TOLERANCE.sqrt());
         assert!((s.dimension_value(dim).unwrap() - 8.0).abs() < SOLVE_TOLERANCE.sqrt());
@@ -281,5 +375,143 @@ mod tests {
         assert_eq!(s.dimension(dim).unwrap().offset, [3.0, -2.0]);
         // Wert unberührt.
         assert_eq!(s.dimension_value(dim), Some(10.0));
+    }
+
+    #[test]
+    fn each_dimension_reduces_dof_by_one() {
+        let mut s = Sketch::new();
+        let (p1, p2) = line(&mut s);
+        // Freie Linie: 2 Punkte = 4 Variablen, keine Constraints → 4 DOF.
+        let dof0 = s.dof();
+        assert_eq!(dof0, 4);
+        s.add_dimension(DimensionTarget::Linear(p1, p2), 10.0, [0.0, 0.0])
+            .expect("dimension");
+        assert_eq!(s.dof(), dof0 - 1);
+
+        let c = s.add_point([5.0, 5.0]);
+        let circle = s.add_circle(c, 2.0);
+        let dof_before_radius = s.dof();
+        s.add_dimension(DimensionTarget::Radius(circle), 2.0, [0.0, 0.0])
+            .expect("dimension");
+        assert_eq!(s.dof(), dof_before_radius - 1);
+    }
+
+    /// Rechteck (geteilte Ecken, H/V-Constraints); startet bei `w`×`h`.
+    fn rectangle(w: f64, h: f64) -> (Sketch, [PointId; 4]) {
+        let mut s = Sketch::new();
+        let bl = s.add_point([0.0, 0.0]);
+        let br = s.add_point([w, 0.0]);
+        let tr = s.add_point([w, h]);
+        let tl = s.add_point([0.0, h]);
+        let bottom = s.add_line(bl, br);
+        let right = s.add_line(br, tr);
+        let top = s.add_line(tr, tl);
+        let left = s.add_line(tl, bl);
+        s.add_constraint(Constraint::Horizontal(bottom)).unwrap();
+        s.add_constraint(Constraint::Horizontal(top)).unwrap();
+        s.add_constraint(Constraint::Vertical(left)).unwrap();
+        s.add_constraint(Constraint::Vertical(right)).unwrap();
+        (s, [bl, br, tr, tl])
+    }
+
+    fn positions(s: &Sketch) -> Vec<[f64; 2]> {
+        s.points().map(|(_, p)| p).collect()
+    }
+
+    fn distance(s: &Sketch, a: PointId, b: PointId) -> f64 {
+        let (a, b) = (s.point_pos(a), s.point_pos(b));
+        ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
+    }
+
+    /// Akzeptanz 2: eine redundante *konsistente* Diagonale wird als
+    /// `Overconstraining` (nicht `Conflicting`) abgelehnt; Zustand bleibt.
+    #[test]
+    fn redundant_consistent_dimension_is_overconstraining() {
+        let (mut s, [bl, br, tr, tl]) = rectangle(10.0, 10.0);
+        s.add_dimension(DimensionTarget::Linear(bl, br), 8.0, [0.0, -1.0])
+            .expect("width");
+        s.add_dimension(DimensionTarget::Linear(bl, tl), 6.0, [-1.0, 0.0])
+            .expect("height");
+        // Aktuelle Diagonale ist exakt konsistent (√(8²+6²) = 10).
+        let diag = distance(&s, bl, tr);
+        let before = positions(&s);
+
+        let err = s
+            .add_dimension(DimensionTarget::Linear(bl, tr), diag, [0.0, 0.0])
+            .expect_err("redundant");
+        assert!(
+            matches!(err, DimensionError::Overconstraining { .. }),
+            "erwartet Overconstraining, war {err:?}"
+        );
+        assert_eq!(positions(&s), before);
+        assert_eq!(s.dimension_count(), 2);
+    }
+
+    /// Eine widersprüchliche Diagonale wird als `Conflicting` abgelehnt und
+    /// die Skizze bleibt exakt im vorherigen Zustand.
+    #[test]
+    fn contradictory_dimension_is_conflicting_and_state_unchanged() {
+        let (mut s, [bl, br, tr, tl]) = rectangle(10.0, 10.0);
+        s.add_dimension(DimensionTarget::Linear(bl, br), 8.0, [0.0, -1.0])
+            .expect("width");
+        s.add_dimension(DimensionTarget::Linear(bl, tl), 6.0, [-1.0, 0.0])
+            .expect("height");
+        let diag = distance(&s, bl, tr);
+        let before = positions(&s);
+
+        let err = s
+            .add_dimension(DimensionTarget::Linear(bl, tr), diag + 5.0, [0.0, 0.0])
+            .expect_err("contradiction");
+        assert!(
+            matches!(err, DimensionError::Conflicting { .. }),
+            "erwartet Conflicting, war {err:?}"
+        );
+        assert_eq!(positions(&s), before);
+        assert_eq!(s.dimension_count(), 2);
+    }
+
+    /// Ein zweites, gleiches Abstandsmaß auf dieselbe Strecke ist redundant
+    /// und konsistent ⇒ Overconstraining.
+    #[test]
+    fn duplicate_distance_dimension_is_overconstraining() {
+        let mut s = Sketch::new();
+        let (p1, p2) = line(&mut s);
+        s.add_dimension(DimensionTarget::Linear(p1, p2), 10.0, [0.0, 1.0])
+            .expect("first");
+        let err = s
+            .add_dimension(DimensionTarget::Linear(p1, p2), 10.0, [0.0, 2.0])
+            .expect_err("duplicate");
+        assert!(matches!(err, DimensionError::Overconstraining { .. }));
+        assert_eq!(s.dimension_count(), 1);
+    }
+
+    proptest! {
+        /// Akzeptanz 1: zufällige *konsistente* Breite/Höhe konvergieren;
+        /// eine widersprüchliche Diagonale wird abgelehnt und die Skizze
+        /// bleibt exakt im vorherigen Zustand.
+        #[test]
+        fn consistent_dimensions_converge_contradiction_rejected(
+            w in 2.0f64..20.0,
+            h in 2.0f64..20.0,
+        ) {
+            let (mut s, [bl, br, tr, tl]) = rectangle(10.0, 10.0);
+            s.add_dimension(DimensionTarget::Linear(bl, br), w, [0.0, -1.0])
+                .expect("width converges");
+            s.add_dimension(DimensionTarget::Linear(bl, tl), h, [-1.0, 0.0])
+                .expect("height converges");
+            let tol = SOLVE_TOLERANCE.sqrt();
+            prop_assert!((distance(&s, bl, br) - w).abs() < tol);
+            prop_assert!((distance(&s, bl, tl) - h).abs() < tol);
+
+            let before = positions(&s);
+            let diag = distance(&s, bl, tr);
+            let err = s
+                .add_dimension(DimensionTarget::Linear(bl, tr), diag + 1.0, [0.0, 0.0])
+                .expect_err("contradiction rejected");
+            let is_conflicting = matches!(err, DimensionError::Conflicting { .. });
+            prop_assert!(is_conflicting, "erwartet Conflicting, war {:?}", err);
+            prop_assert_eq!(positions(&s), before);
+            prop_assert_eq!(s.dimension_count(), 2);
+        }
     }
 }

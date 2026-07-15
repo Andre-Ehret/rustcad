@@ -8,6 +8,26 @@ use crate::camera::OrbitCamera;
 use crate::renderer::{encode_pick, PickId, SceneCallback, SceneRenderer, Uniforms};
 use crate::sketch_mode::{self, SketchSession, SketchTool};
 
+/// UI-Meldung für einen abgelehnten Bemaßungsversuch. Die Domäne liefert
+/// nur den strukturierten [`rustcad_sketch::DimensionError`] (Guardrail 3);
+/// hier wird konkret benannt, was schiefging und welcher Wert abgelehnt wurde.
+fn dimension_error_message(err: rustcad_sketch::DimensionError) -> String {
+    use rustcad_sketch::DimensionError as E;
+    let v = |value: f64| sketch_mode::format_dimension(value);
+    match err {
+        E::Conflicting { value } => {
+            format!("Bemaßung {} kollidiert mit bestehenden Constraints", v(value))
+        }
+        E::Overconstraining { value } => {
+            format!("Bemaßung {} überbestimmt die Skizze (redundant)", v(value))
+        }
+        E::DidNotConverge { value } => {
+            format!("Solver für Bemaßung {} nicht konvergiert", v(value))
+        }
+        E::Reference(_) => "Ungültige Bemaßungsreferenz".to_string(),
+    }
+}
+
 /// Interaktions-Zustandsmaschine (TECH_SPEC §7.4). Jeder Tool-Wechsel
 /// läuft über dieses Enum.
 enum AppMode {
@@ -489,6 +509,14 @@ impl RustcadApp {
                         session.sketch.dof(),
                         status,
                     ));
+                    // Abgelehnter Bemaßungsversuch: konkrete Meldung als Toast.
+                    if let Some(err) = session.last_dim_error {
+                        ui.separator();
+                        ui.colored_label(
+                            egui::Color32::from_rgb(240, 120, 90),
+                            format!("⚠ {}", dimension_error_message(err)),
+                        );
+                    }
                 }
             }
         });
@@ -508,6 +536,7 @@ impl RustcadApp {
                 if let AppMode::SketchEdit(session) = &mut self.mode {
                     session.tool = tool;
                     session.selection.clear();
+                    session.last_dim_error = None;
                 }
             }
             ToolbarAction::AddAction(sketch_action) => {

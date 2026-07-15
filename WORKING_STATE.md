@@ -10,14 +10,18 @@ deliberately left for later. For the full design rationale see
 ## Status at a glance
 
 - **MVP complete** — all six milestones from `TECH_SPEC.md` are implemented.
-- **Tests: 36 passing** across the workspace (7 in `rustcad-core`,
-  8 in `rustcad-geom`, 21 in `rustcad-sketch`), 0 failing.
+- **Parametric dimensions** (post-MVP, Issues 1–4) are implemented on top of
+  the MVP: driving dimensions with separated display, overlay rendering, a
+  dimension tool, and value editing with conflict handling. See the
+  [dimensions section](#parametric-dimensions-issues-14-post-mvp) below.
+- **Tests: 61 passing** across the workspace (8 in `rustcad-core`,
+  8 in `rustcad-geom`, 32 in `rustcad-sketch`, 13 in `rustcad-app`), 0 failing.
 - **Clippy: clean** with `-D warnings` (only a future-incompat note remains,
   and it comes from transitive deps `nom`/`quick-xml`, not our code).
-- **Git**: on `main`, working tree clean. History was squashed into
-  `ff0c01e Initial MVP Setup` on top of `d7baf86 Initial commit`.
-- **No GitHub remote** is configured yet. A CI workflow is prepared and will
-  run on the first push.
+- **Git**: a GitHub remote is configured. Dimension work lands one issue per
+  branch via PRs (`1-…` data model, `2-…` rendering, `3-…` tool merged into
+  `main`). Currently on `4-editing-values-and-conflict-handling` (editing &
+  conflict handling) — implemented in the working tree, not yet committed.
 
 ## Toolchain & environment
 
@@ -57,10 +61,10 @@ rustcad/
 fully testable with `cargo test`. All `truck` types stay encapsulated inside
 `rustcad-geom`.
 
-Approximate source sizes (LoC): `app.rs` 862, `sketch_mode.rs` 541,
-`renderer.rs` 510, `core/lib.rs` 526, `geom/lib.rs` 478, `solver.rs` 458,
-`sketch/lib.rs` 360, `profiles.rs` 306, `constraint.rs` 270,
-`core/persist.rs` 145, `camera.rs` 95, `main.rs` 30.
+Approximate source sizes (LoC): `sketch_mode.rs` 1436, `app.rs` 893,
+`core/lib.rs` 526, `dimension.rs` 517, `renderer.rs` 510, `solver.rs` 483,
+`geom/lib.rs` 478, `sketch/lib.rs` 375, `profiles.rs` 306, `constraint.rs` 270,
+`core/persist.rs` 191, `camera.rs` 95, `main.rs` 30.
 
 ## What works today (per milestone)
 
@@ -117,6 +121,47 @@ Documented MVP deviations from spec §4: `f64` parameters instead of a
   exactly one snapshot at drag start (`drag_started || !dragging` heuristic).
   **No redo** (deliberate).
 
+## Parametric dimensions (Issues 1–4, post-MVP)
+
+A dimension is **not a new subsystem** but an existing *driving* constraint
+(`Distance` or `Radius`) plus a display annotation: the **value** lives in the
+constraint (solver domain), the **placement** lives in the annotation (a label
+offset *relative* to the geometry, so the label follows the solver).
+
+- **Data model** (`rustcad-sketch/dimension.rs`): `Dimension { constraint,
+  kind, offset }` with `DimensionKind` Linear / Radius / Diameter. A diameter
+  is stored internally as a radius `r`; only the display shows `⌀ = 2r`.
+  Encapsulated mutations `add_dimension` / `set_dimension_value` /
+  `set_dimension_offset` / `remove_dimension`; deleting a dimension deletes its
+  driving constraint and vice versa (cascade + `prune_dangling_dimensions`).
+  Serialized in `.rcad` (**`format_version` bumped to 2**, new `dimensions`
+  field is `#[serde(default)]` so v1 files still load).
+- **Rendering** (`rustcad-app/sketch_mode.rs`): classic technical dimensions in
+  **screen space** (stroke width, arrowheads and text size are zoom-independent;
+  only positions go through `plane_to_screen`) via the egui painter — dimension
+  line + extension lines, arrowheads, `R{v}` / `⌀{v}` labels with a legibility
+  background. Hover/selection hit-test on the label box and the dimension line;
+  a **label drag changes only the offset** (no solver run).
+- **Dimension tool** (`SketchTool::Dimension`, explicit state machine
+  Selecting → Placing → Editing, no implicit modes): click a **line** → length,
+  two **points** in sequence → point-to-point distance, a **circle** → ⌀
+  (toggle to R with the `R` key while placing). A click places the label, then
+  an **inline egui field** at the label confirms the value (Enter = typed value,
+  Esc = current measured value). **Double-click** an existing dimension to edit
+  its value.
+- **Conflict handling**: `add_dimension` / `set_dimension_value` solve and
+  validate, rolling the sketch back to the **exact** previous state on
+  rejection. Jacobian rank analysis classifies the structured
+  `DimensionError` (thiserror, no UI strings): `Overconstraining` (redundant but
+  numerically consistent), `Conflicting` (redundant + inconsistent) and
+  `DidNotConverge`. The UI surfaces a concrete toast naming the problem and the
+  rejected value. Each independent driving dimension reduces the **DOF by 1**
+  (shown in the status bar).
+- **Not yet** (planned as separate issues): dimensions **between two edges**
+  (line–line) or **point–line**; and **driven/reference dimensions**
+  (measure-only, no driving constraint) as the escape hatch for overconstrained
+  cases.
+
 ## Controls
 
 | Action | Input |
@@ -130,7 +175,11 @@ Documented MVP deviations from spec §4: `f64` parameters instead of a
 | Sketch: draw / select | click (Shift: multi-select) |
 | Sketch: drag point | drag (solver runs live) |
 | Sketch: cancel tool | `Esc` |
-| Sketch: delete entity | `Del` / `Backspace` |
+| Sketch: delete entity / dimension | `Del` / `Backspace` |
+| Sketch: dimension | select geometry → click to place label → type value |
+| Sketch: toggle ⌀ / R | `R` (while placing a circle dimension) |
+| Sketch: edit dimension | double-click the dimension |
+| Sketch: move dim label | drag the label (offset only, no solve) |
 
 Typical flow: pick a sketch plane → draw a profile → add constraints →
 **✔ Done** → **Extrude** / **Revolve** → adjust parameters in the properties
@@ -161,12 +210,15 @@ panel → save or export as STL.
 
 Boolean operations, fillets/chamfers, assemblies, STEP import/export, nested
 profiles (holes), named parameters with expressions, sketching on body faces,
-circular arcs, and a constraint-delete UI.
+circular arcs, and a constraint-delete UI. On the dimension side (see above):
+line–line and point–line dimensions, and driven/reference dimensions.
 
 ## Suggested next steps
 
-1. Set up the GitHub remote and push so CI runs for the first time.
-2. Pick the first v2 feature (booleans and fillets are the most requested
-   modeling gaps).
+1. Finish the dimension work: merge `4-editing-values-and-conflict-handling`,
+   then a follow-up issue for **dimensioning between two elements** (line–line
+   and point–line), and later **driven/reference dimensions**.
+2. Pick the first v2 modeling feature (booleans and fillets are the most
+   requested modeling gaps).
 3. Consider redo support and a proper `ParamTable` with expressions, both
    already scoped in the spec.
