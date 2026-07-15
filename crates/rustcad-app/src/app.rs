@@ -38,7 +38,7 @@ enum ToolbarAction {
     ExportStl,
     EnterSketch(SketchPlane),
     SetTool(SketchTool),
-    AddConstraint(rustcad_sketch::Constraint),
+    AddAction(sketch_mode::SketchAction),
     FinishSketch,
     OpenExtrude,
     OpenRevolve,
@@ -463,9 +463,9 @@ impl RustcadApp {
                         }
                     }
                     ui.separator();
-                    for (label, constraint) in session.available_constraints() {
+                    for (label, sketch_action) in session.available_actions() {
                         if ui.button(label).clicked() {
-                            action = ToolbarAction::AddConstraint(constraint);
+                            action = ToolbarAction::AddAction(sketch_action);
                         }
                     }
                     ui.separator();
@@ -480,10 +480,11 @@ impl RustcadApp {
                         _ => "",
                     };
                     ui.label(format!(
-                        "{} · {} Entities · {} Constraints · {} Freiheitsgrade{}",
+                        "{} · {} Entities · {} Constraints · {} Maße · {} Freiheitsgrade{}",
                         session.plane.label(),
                         session.sketch.entity_count(),
                         session.sketch.constraint_count(),
+                        session.sketch.dimension_count(),
                         session.sketch.dof(),
                         status,
                     ));
@@ -508,9 +509,9 @@ impl RustcadApp {
                     session.selection.clear();
                 }
             }
-            ToolbarAction::AddConstraint(constraint) => {
+            ToolbarAction::AddAction(sketch_action) => {
                 if let AppMode::SketchEdit(session) = &mut self.mode {
-                    session.apply_constraint(constraint);
+                    session.apply_action(sketch_action);
                 }
             }
             ToolbarAction::FinishSketch => {
