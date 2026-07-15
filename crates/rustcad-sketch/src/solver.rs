@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use nalgebra::{DMatrix, DVector};
 
 use crate::constraint::{EqKind, Equation};
-use crate::{PointId, Sketch, VarId};
+use crate::{ConstraintId, PointId, Sketch, VarId};
 
 /// Konvergenz: `‖F‖∞ < TOLERANCE`.
 pub const SOLVE_TOLERANCE: f64 = 1e-9;
@@ -59,23 +59,37 @@ impl Sketch {
     }
 
     /// Verbleibende Freiheitsgrade: `freie Variablen − Rang(J)`
-    /// an der aktuellen Konfiguration (TECH_SPEC §5.3).
+    /// an der aktuellen Konfiguration (TECH_SPEC §5.3). Jede treibende
+    /// Bemaßung ist ein Distance/Radius-Constraint und senkt — sofern
+    /// unabhängig — den Rang und damit die Freiheitsgrade um 1.
     pub fn dof(&self) -> usize {
         let vars = self.active_vars();
-        let equations = self.lowered_equations();
-        if equations.is_empty() {
-            return vars.len();
+        vars.len().saturating_sub(self.constraint_rank(None))
+    }
+
+    /// Rang der Constraint-Jacobi an der aktuellen Konfiguration,
+    /// optional unter Auslassung eines Constraints.
+    fn constraint_rank(&self, exclude: Option<ConstraintId>) -> usize {
+        let mut equations = Vec::new();
+        for (id, c) in self.constraints.iter() {
+            if Some(id) == exclude {
+                continue;
+            }
+            self.lower_constraint(c, &mut equations);
         }
+        if equations.is_empty() {
+            return 0;
+        }
+        let vars = self.active_vars();
         let index = var_index(&vars);
-        let jacobian = self.build_jacobian(&equations, &vars, &index);
-        let singular = jacobian.svd(false, false).singular_values;
-        let max = singular.max();
-        let rank = if max <= 0.0 {
-            0
-        } else {
-            singular.iter().filter(|&&s| s > max * 1e-10).count()
-        };
-        vars.len().saturating_sub(rank)
+        jacobian_rank(self.build_jacobian(&equations, &vars, &index))
+    }
+
+    /// Erhöht der treibende Constraint `driver` den Rang des Systems?
+    /// Unabhängig ⇒ echte, freiheitsgrad-reduzierende Bemaßung; sonst
+    /// redundant (überbestimmend oder — bei ≠ 0-Residuum — widersprüchlich).
+    pub(crate) fn increases_rank(&self, driver: ConstraintId) -> bool {
+        self.constraint_rank(None) > self.constraint_rank(Some(driver))
     }
 
     /// Aktive Variablen in stabiler Reihenfolge: Punktkoordinaten,
@@ -206,6 +220,17 @@ impl Sketch {
 
 fn var_index(vars: &[VarId]) -> HashMap<VarId, usize> {
     vars.iter().enumerate().map(|(i, &v)| (v, i)).collect()
+}
+
+/// Numerischer Rang über die Singulärwerte (relative Schwelle).
+fn jacobian_rank(jacobian: DMatrix<f64>) -> usize {
+    let singular = jacobian.svd(false, false).singular_values;
+    let max = singular.max();
+    if max <= 0.0 {
+        0
+    } else {
+        singular.iter().filter(|&&s| s > max * 1e-10).count()
+    }
 }
 
 #[cfg(test)]

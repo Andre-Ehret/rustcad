@@ -2,8 +2,8 @@ use egui::{Color32, FontId, Pos2, Rect, Stroke, Vec2};
 use glam::{Mat4, Vec3};
 use rustcad_core::{FeatureId, SketchPlane};
 use rustcad_sketch::{
-    Constraint, Dimension, DimensionId, DimensionKind, DimensionTarget, EntityId, PointId, Sketch,
-    SketchEntity, SolveResult,
+    Constraint, Dimension, DimensionError, DimensionId, DimensionKind, DimensionTarget, EntityId,
+    PointId, Sketch, SketchEntity, SolveResult,
 };
 
 use crate::camera::OrbitCamera;
@@ -79,6 +79,9 @@ pub enum DimStage {
         text: String,
         /// Beim ersten Frame den Fokus ins Eingabefeld setzen.
         focus: bool,
+        /// Beim Editieren einer *bestehenden* Bemaßung (Doppelklick) deren
+        /// ID; `None` beim Anlegen einer neuen.
+        existing: Option<DimensionId>,
     },
 }
 
@@ -161,6 +164,9 @@ pub struct SketchSession {
     pub selection: Vec<Selected>,
     /// Ergebnis des letzten Solver-Laufs (für die Statusanzeige).
     pub last_solve: Option<SolveResult>,
+    /// Letzter abgelehnter Bemaßungsversuch (Konflikt/Überbestimmung) —
+    /// die UI formt daraus ihre Meldung. Wird bei Erfolg gelöscht.
+    pub last_dim_error: Option<DimensionError>,
     dragging: Option<PointId>,
     /// Läuft ein Label-Drag einer Bemaßung? Ändert nur den Offset,
     /// nie die Geometrie (der Solver wird nicht angestoßen).
@@ -202,6 +208,7 @@ impl SketchSession {
             tool: SketchTool::Select,
             selection: Vec::new(),
             last_solve: None,
+            last_dim_error: None,
             dragging: None,
             dragging_dim: None,
             saved_camera,
@@ -246,18 +253,36 @@ impl SketchSession {
 
     /// Wendet eine Toolbar-Aktion an und löst sofort. Bemaßungen legen
     /// ihren treibenden Constraint mit an und bekommen einen sinnvollen
-    /// Start-Offset, damit das Label neben der Geometrie sitzt.
+    /// Start-Offset, damit das Label neben der Geometrie sitzt. Konflikte
+    /// landen in [`SketchSession::last_dim_error`].
     pub fn apply_action(&mut self, action: SketchAction) {
-        let ok = match action {
-            SketchAction::Constraint(c) => self.sketch.add_constraint(c).is_ok(),
+        match action {
+            SketchAction::Constraint(c) => {
+                if self.sketch.add_constraint(c).is_ok() {
+                    self.last_solve = Some(self.sketch.solve());
+                    self.last_dim_error = None;
+                    self.selection.clear();
+                }
+            }
             SketchAction::Dimension(target, value) => {
                 let offset = self.default_dim_offset(target);
-                self.sketch.add_dimension(target, value, offset).is_ok()
+                self.commit_new_dimension(target, value, offset);
             }
-        };
-        if ok {
-            self.last_solve = Some(self.sketch.solve());
-            self.selection.clear();
+        }
+    }
+
+    /// Legt eine neue Bemaßung an (mit Konfliktbehandlung). Bei Erfolg
+    /// wird die Selektion geleert und der Fehler gelöscht; bei Ablehnung
+    /// bleibt die Skizze unverändert und `last_dim_error` wird gesetzt.
+    fn commit_new_dimension(&mut self, target: DimensionTarget, value: f64, offset: [f64; 2]) {
+        match self.sketch.add_dimension(target, value, offset) {
+            Ok(_) => {
+                // add_dimension hat bereits konfliktfrei gelöst.
+                self.last_dim_error = None;
+                self.last_solve = Some(SolveResult::Solved { iterations: 0 });
+                self.selection.clear();
+            }
+            Err(err) => self.last_dim_error = Some(err),
         }
     }
 
@@ -377,6 +402,11 @@ impl SketchSession {
         // verarbeitet Klicks, R (Umschalten ⌀/R), Enter/Esc selbst.
         if matches!(self.tool, SketchTool::Dimension(_)) {
             self.handle_dimension_tool(ui, response, &map, mouse_plane, map.px_to_plane(SELECT_TOL_PX));
+        } else if response.double_clicked() {
+            // Doppelklick auf eine Bemaßung öffnet ihr Werteingabefeld.
+            if let Some(stage) = dim_hit.and_then(|id| self.begin_edit_dimension(id)) {
+                self.tool = SketchTool::Dimension(stage);
+            }
         } else if let Some(pos) = mouse_plane {
             if response.clicked() {
                 let shift = ui.input(|i| i.modifiers.shift);
@@ -551,6 +581,7 @@ impl SketchSession {
                                 offset,
                                 text: format!("{value:.4}"),
                                 focus: true,
+                                existing: None,
                             })
                         }
                         None => SketchTool::Dimension(DimStage::Placing { target }),
@@ -564,6 +595,7 @@ impl SketchSession {
                 offset,
                 mut text,
                 focus,
+                existing,
             } => {
                 let measured = self.measured_value(target);
                 let label_pos = {
@@ -601,16 +633,34 @@ impl SketchSession {
 
                 match value {
                     Some(v) => {
-                        if self.sketch.add_dimension(target, v, offset).is_ok() {
-                            self.last_solve = Some(self.sketch.solve());
+                        // Bestehende Bemaßung ändern bzw. neue anlegen; bei
+                        // Konflikt bleibt die Skizze unverändert.
+                        let result = match existing {
+                            Some(id) => self.sketch.set_dimension_value(id, v),
+                            None => self.sketch.add_dimension(target, v, offset).map(|_| ()),
+                        };
+                        match result {
+                            Ok(()) => {
+                                self.last_dim_error = None;
+                                self.last_solve = Some(SolveResult::Solved { iterations: 0 });
+                            }
+                            Err(err) => self.last_dim_error = Some(err),
                         }
-                        SketchTool::dimension()
+                        // Nach dem Editieren einer bestehenden Bemaßung zurück
+                        // zur Auswahl; nach dem Anlegen bereit für die nächste.
+                        if existing.is_some() {
+                            self.selection.clear();
+                            SketchTool::Select
+                        } else {
+                            SketchTool::dimension()
+                        }
                     }
                     None => SketchTool::Dimension(DimStage::Editing {
                         target,
                         offset,
                         text,
                         focus: false,
+                        existing,
                     }),
                 }
             }
@@ -685,6 +735,21 @@ impl SketchSession {
                 }
             }
         }
+    }
+
+    /// Baut den Werteingabe-Zustand für eine *bestehende* Bemaßung
+    /// (Doppelklick); `None`, falls die Bemaßung ungültig ist.
+    fn begin_edit_dimension(&self, id: DimensionId) -> Option<DimStage> {
+        let dim = self.sketch.dimension(id)?;
+        let target = self.dim_target(dim)?;
+        let value = self.sketch.dimension_value(id)?;
+        Some(DimStage::Editing {
+            target,
+            offset: dim.offset,
+            text: format!("{value:.4}"),
+            focus: true,
+            existing: Some(id),
+        })
     }
 
     fn paint(
@@ -1291,5 +1356,81 @@ mod tests {
         let map = PlaneMap::new(SketchPlane::XY, &camera, viewport());
         let geom = session.dim_screen_geom(&map, dim).expect("geometry");
         assert_eq!(geom.text, "⌀4.00");
+    }
+
+    /// Akzeptanz 3: Doppelklick-Editieren bereitet für alle drei
+    /// Bemaßungsarten das korrekte Eingabefeld vor (bestehende ID + Ziel).
+    #[test]
+    fn double_click_edit_prepares_input_for_all_kinds() {
+        let mut camera = OrbitCamera::default();
+        let mut session = SketchSession::start(SketchPlane::XY, &mut camera);
+        let p1 = session.sketch.add_point([0.0, 0.0]);
+        let p2 = session.sketch.add_point([10.0, 0.0]);
+        session.sketch.add_line(p1, p2);
+        let c1 = session.sketch.add_point([0.0, 20.0]);
+        let circle1 = session.sketch.add_circle(c1, 3.0);
+        let c2 = session.sketch.add_point([0.0, 40.0]);
+        let circle2 = session.sketch.add_circle(c2, 5.0);
+
+        let lin = session
+            .sketch
+            .add_dimension(DimensionTarget::Linear(p1, p2), 10.0, [0.0, -2.0])
+            .unwrap();
+        let rad = session
+            .sketch
+            .add_dimension(DimensionTarget::Radius(circle1), 3.0, [2.0, 2.0])
+            .unwrap();
+        let dia = session
+            .sketch
+            .add_dimension(DimensionTarget::Diameter(circle2), 10.0, [3.0, 3.0])
+            .unwrap();
+
+        for (id, expected, expected_text) in [
+            (lin, DimensionTarget::Linear(p1, p2), "10.0000"),
+            (rad, DimensionTarget::Radius(circle1), "3.0000"),
+            (dia, DimensionTarget::Diameter(circle2), "10.0000"),
+        ] {
+            match session.begin_edit_dimension(id).expect("edit stage") {
+                DimStage::Editing {
+                    target,
+                    existing,
+                    focus,
+                    text,
+                    ..
+                } => {
+                    assert_eq!(target, expected);
+                    assert_eq!(existing, Some(id));
+                    assert!(focus);
+                    assert_eq!(text, expected_text);
+                }
+                other => panic!("erwartet Editing, war {other:?}"),
+            }
+        }
+
+        // Der zugrunde liegende Edit ändert den Wert (least motion).
+        session.sketch.set_dimension_value(dia, 12.0).expect("edit");
+        let tol = 1e-4;
+        assert!((session.sketch.circle_radius(circle2).unwrap() - 6.0).abs() < tol);
+    }
+
+    #[test]
+    fn rejected_dimension_records_structured_error() {
+        let mut camera = OrbitCamera::default();
+        let mut session = SketchSession::start(SketchPlane::XY, &mut camera);
+        let p1 = session.sketch.add_point([0.0, 0.0]);
+        let p2 = session.sketch.add_point([10.0, 0.0]);
+        session.sketch.add_line(p1, p2);
+
+        session.commit_new_dimension(DimensionTarget::Linear(p1, p2), 10.0, [0.0, -2.0]);
+        assert!(session.last_dim_error.is_none());
+        assert_eq!(session.sketch.dimension_count(), 1);
+
+        // Zweites, redundantes Maß auf dieselbe Strecke → Overconstraining.
+        session.commit_new_dimension(DimensionTarget::Linear(p1, p2), 10.0, [0.0, -3.0]);
+        assert!(matches!(
+            session.last_dim_error,
+            Some(DimensionError::Overconstraining { .. })
+        ));
+        assert_eq!(session.sketch.dimension_count(), 1);
     }
 }
